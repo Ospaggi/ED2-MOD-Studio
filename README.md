@@ -42,8 +42,6 @@ py -3 ed2_mod_studio.py C:\GAMES\ED2 --export-analysis analysis --no-gui
 +0x17  행운          uint8
 ```
 
-속도와 행운은 더 이상 후보로 표시하지 않습니다. 값 범위는 원본 구조 그대로 `0~255`이며 도구가 임의의 게임 밸런스 제한을 추가하지 않습니다.
-
 ## EXP·Gold 오버플로 자동 방지
 
 게임은 전투 중 EXP와 Gold를 16비트 누적 변수에 더합니다.
