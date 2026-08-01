@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Iterable, Optional, Any
 
 APP_NAME = "ED2 Mod Studio"
-VERSION = "0.8.1"
+VERSION = "0.8.2"
 ITEM_COUNT = 76
 ITEM_NAME_BASE = 0x14A185
 ITEM_STRIDE = 20
@@ -965,6 +965,52 @@ class MagicRecord:
     @property
     def count_low(self) -> int:
         return self.count_raw & 0x0F
+
+
+def describe_magic_multiplier(multiplier: int) -> str:
+    """Return a concise Korean explanation of MAGIC_BAIRITU."""
+    if not 0 <= multiplier <= 0x7F:
+        return "MAGIC_BAIRITU 값이 0..127 범위를 벗어났습니다."
+    if multiplier == 100:
+        scale = "기준 효과와 동일"
+    elif multiplier == 0:
+        scale = "효과 기준값이 0"
+    elif multiplier < 100:
+        scale = f"기준 효과의 약 {multiplier}%"
+    else:
+        scale = f"기준 효과보다 약 {multiplier - 100}% 강함"
+    return f"MAGIC_BAIRITU={multiplier}: 마법 효과 배율 · {scale} (100=기준)"
+
+
+def describe_magic_count(count_raw: int) -> tuple[str, bool]:
+    """Explain the packed MAGIC_CNT recharge timing byte.
+
+    The low nibble is the initial countdown and the high nibble is the
+    repeating countdown. A zero nibble can underflow in the original code,
+    so the UI flags it as unsafe rather than presenting it as instant charge.
+    """
+    if not 0 <= count_raw <= 0xFF:
+        return "MAGIC_CNT 값이 0..255 범위를 벗어났습니다.", True
+    high = (count_raw >> 4) & 0x0F
+    low = count_raw & 0x0F
+    if high == 0 or low == 0:
+        return (
+            f"MAGIC_CNT=0x{count_raw:02X}: 시작 주기 {low}, 반복 주기 {high} · "
+            "0 니블은 언더플로로 비정상 충전될 수 있으므로 사용하지 않는 것이 안전합니다.",
+            True,
+        )
+    estimated = low + high * 14
+    if high == low == 1:
+        speed = "가장 빠른 안정 권장값"
+    elif high == low:
+        speed = f"0x11보다 대략 {high}배 느린 균일 주기"
+    else:
+        speed = "초기 주기와 반복 주기가 다른 사용자 설정"
+    return (
+        f"MAGIC_CNT=0x{count_raw:02X}: 시작 주기 {low}, 반복 주기 {high}, "
+        f"예상 총 카운트 {estimated} · {speed}",
+        False,
+    )
 
 
 def decode_magic_name(raw: bytes) -> str:
@@ -2043,20 +2089,35 @@ def run_gui(initial_root: Optional[Path] = None, audio_tool: Optional[Path] = No
             ttk.Button(bar,text="CSV 내보내기",command=self.export_magics_csv).pack(side="left")
             cols=("id","name","cost","slc","slc2","ratio","cnt","handler")
             self.magic_tree=self._tree(left,cols,selectmode="browse")
-            for col,label,width in (("id","ID",45),("name","MAGIC_NAME",150),("cost","MAGIC_COST",85),("slc","MAGIC_SLC",85),("slc2","MAGIC_SLC2",90),("ratio","MAGIC_BAIRITU",110),("cnt","MAGIC_CNT",90),("handler","MAGIC_TABLE handler",180)):
+            for col,label,width in (("id","ID",45),("name","MAGIC_NAME",150),("cost","MAGIC_COST",85),("slc","MAGIC_SLC",85),("slc2","MAGIC_SLC2",90),("ratio","MAGIC_BAIRITU (효과%)",145),("cnt","MAGIC_CNT (충전)",125),("handler","MAGIC_TABLE handler",180)):
                 self.magic_tree.heading(col,text=label);self.magic_tree.column(col,width=width,minwidth=45,anchor="w" if col in ("name","handler") else "center")
             self.magic_tree.bind("<<TreeviewSelect>>",lambda _e:self.show_magic())
             ttk.Label(right,text="마법 상세",style="Title.TLabel").pack(anchor="w")
             form=ttk.Frame(right);form.pack(fill="x",pady=(8,0))
             self.magic_vars={k:tk.StringVar() for k in ("id","name","cost","select_flags","multiplier","count_raw","handler")}
-            rows=[("id","마법 ID"),("name","MAGIC_NAME (CP949 최대 8바이트)"),("cost","MAGIC_COST"),("select_flags","MAGIC_SLC 원시 플래그"),("multiplier","MAGIC_BAIRITU 0..127"),("count_raw","MAGIC_CNT 원시 바이트"),("handler","MAGIC_TABLE 처리 함수 (읽기 전용)")]
+            rows=[("id","마법 ID"),("name","MAGIC_NAME (CP949 최대 8바이트)"),("cost","MAGIC_COST"),("select_flags","MAGIC_SLC 원시 플래그"),("multiplier","MAGIC_BAIRITU 효과 배율 % (0..127)"),("count_raw","MAGIC_CNT 재충전 주기 (0x11 권장 최소)"),("handler","MAGIC_TABLE 처리 함수 (읽기 전용)")]
             self.magic_entries={}
             for row,(key,label) in enumerate(rows):
                 ttk.Label(form,text=label).grid(row=row,column=0,sticky="w",pady=3);ent=ttk.Entry(form,textvariable=self.magic_vars[key],width=42);ent.grid(row=row,column=1,sticky="ew",padx=(8,0),pady=3);self.magic_entries[key]=ent
+                if key in ("multiplier","count_raw"):
+                    ent.bind("<KeyRelease>",lambda _e:self.update_magic_parameter_help())
             self.magic_entries["id"].configure(state="readonly");self.magic_entries["handler"].configure(state="readonly");form.columnconfigure(1,weight=1)
             self.magic_secondary_var=tk.BooleanVar();ttk.Checkbutton(right,text="MAGIC_SLC2 bit7: 보조 선택 플래그",variable=self.magic_secondary_var).pack(anchor="w",pady=(8,2))
             self.magic_info_var=tk.StringVar();ttk.Label(right,textvariable=self.magic_info_var,wraplength=720,style="Section.TLabel").pack(anchor="w",pady=(4,8))
-            ttk.Label(right,text="MAGIC_CNT의 상·하위 니블 의미는 아직 완전히 확정되지 않았으므로 원시값을 함께 보존합니다. 처리 함수 포인터는 코드 주소라 수정할 수 없습니다.",wraplength=720).pack(anchor="w",pady=(0,8))
+            self.magic_parameter_help_var=tk.StringVar()
+            ttk.Label(right,textvariable=self.magic_parameter_help_var,wraplength=720).pack(anchor="w",pady=(0,8))
+            ttk.Label(
+                right,
+                text=(
+                    "MAGIC_BAIRITU는 마법 효과 배율입니다. 100은 기준 효과, 25는 약 25%입니다. "
+                    "bit7은 배율이 아니라 MAGIC_SLC2 보조 선택 플래그로 따로 편집됩니다.\n"
+                    "MAGIC_CNT는 재충전 주기입니다. 하위 니블은 최초 주기, 상위 니블은 반복 주기이며 숫자가 작을수록 빠릅니다. "
+                    "0x11은 가장 빠른 안정 권장값, 0x22는 약 2배, 0x55는 약 5배 느립니다. "
+                    "0x00처럼 어느 한 니블이 0인 값은 언더플로 위험이 있으므로 피하십시오."
+                ),
+                wraplength=720,
+            ).pack(anchor="w",pady=(0,8))
+            ttk.Label(right,text="MAGIC_TABLE 처리 함수 포인터는 코드 주소이므로 수정할 수 없습니다.",wraplength=720).pack(anchor="w",pady=(0,8))
             btn=ttk.Frame(right);btn.pack(fill="x")
             ttk.Button(btn,text="마법 저장 (EXE.bak)",command=self.save_magic).pack(side="left")
             ttk.Button(btn,text="EXE 백업 복원",command=self.restore_exe).pack(side="left",padx=6)
@@ -2077,7 +2138,23 @@ def run_gui(initial_root: Optional[Path] = None, audio_tool: Optional[Path] = No
             values={"id":magic.magic_id,"name":magic.name,"cost":magic.cost,"select_flags":f"0x{magic.select_flags:02X}","multiplier":magic.multiplier,"count_raw":f"0x{magic.count_raw:02X}","handler":f"{magic.handler_name} @ 86:{magic.handler_offset:04X}"}
             for key,value in values.items():self.magic_vars[key].set(str(value))
             self.magic_secondary_var.set(magic.secondary_select)
-            self.magic_info_var.set(f"MAGIC_CNT high={magic.count_high}, low={magic.count_low} · packed select/multiplier=0x{magic.packed_select_multiplier:02X}")
+            self.magic_info_var.set(f"원시 packed select/multiplier=0x{magic.packed_select_multiplier:02X}")
+            self.update_magic_parameter_help()
+
+        def update_magic_parameter_help(self) -> None:
+            if not hasattr(self,"magic_parameter_help_var"):
+                return
+            try:
+                multiplier=parse_number(self.magic_vars["multiplier"].get(),0,0x7F,"MAGIC_BAIRITU")
+                multiplier_text=describe_magic_multiplier(multiplier)
+            except Exception as exc:
+                multiplier_text=f"MAGIC_BAIRITU 입력 확인: {exc}"
+            try:
+                count_raw=parse_number(self.magic_vars["count_raw"].get(),0,0xFF,"MAGIC_CNT")
+                count_text,_unsafe=describe_magic_count(count_raw)
+            except Exception as exc:
+                count_text=f"MAGIC_CNT 입력 확인: {exc}"
+            self.magic_parameter_help_var.set(multiplier_text+"\n"+count_text)
 
         def save_magic(self) -> None:
             if not self.project or not self.current_magic:return
@@ -2291,7 +2368,7 @@ def run_gui(initial_root: Optional[Path] = None, audio_tool: Optional[Path] = No
             report=self.project.validate()
             lines=[report["tool"],f"Root: {report['root']}","",json.dumps(report["counts"],ensure_ascii=False,indent=2),"",f"Errors ({len(report['errors'])})"]
             lines.extend("  - "+x for x in report["errors"]);lines.extend(["",f"Warnings ({len(report['warnings'])})"]);lines.extend("  - "+x for x in report["warnings"])
-            lines.extend(["","v0.7 추가:","  아이템 ITEM_NAME/ITEM_COST/ITEM_KOUKA/ITEM_MAGIC/ITEM_KOKA_NUM/ITEM_MAGIC_NUM/ITEM_TYPE 명칭 교정","  이벤트 아이템 100..126 이름 편집","  마법 32개 MAGIC_NAME/COST/SLC/SLC2/BAIRITU/CNT 편집","  AI·훅 디버그 심볼 표시","  모든 표와 상세 패널에 가로·세로 스크롤 지원"])
+            lines.extend(["","v0.8.2 추가:","  MAGIC_BAIRITU를 마법 효과 배율(100=기준)로 설명","  MAGIC_CNT를 재충전 주기(하위=최초, 상위=반복)로 설명","  선택한 마법의 배율·충전 속도 실시간 해석과 0 니블 경고 표시","","v0.7 추가:","  아이템 ITEM_NAME/ITEM_COST/ITEM_KOUKA/ITEM_MAGIC/ITEM_KOKA_NUM/ITEM_MAGIC_NUM/ITEM_TYPE 명칭 교정","  이벤트 아이템 100..126 이름 편집","  마법 32개 MAGIC_NAME/COST/SLC/SLC2/BAIRITU/CNT 편집","  AI·훅 디버그 심볼 표시","  모든 표와 상세 패널에 가로·세로 스크롤 지원"])
             self._readonly_text(self.diag_text,"\n".join(lines))
 
         def run_validation(self) -> None:
