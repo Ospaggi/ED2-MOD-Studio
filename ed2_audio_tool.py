@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 APP_NAME = "ED2 Audio & Legacy Tool"
-VERSION = "0.6.3"
+VERSION = "0.6.7"
 
 
 class FormatError(Exception):
@@ -760,7 +760,7 @@ def export_ins_csv(root: Path, out_path: Path) -> int:
 MUS_VOICE_SLOTS = 11
 MUS_FIXED_HEADER = 97
 MUS_BASE_PITCH = 0x1FFF
-MUS_MAX_PITCH = 0x3FFE  # ED2 signed semitone offset: 0x1FFF == 0 st, 0x2000 units/st
+MUS_MAX_PITCH = 0x3FFE  # 14-bit ROL bend word; retail center is 0x1FFF
 
 
 @dataclass
@@ -898,6 +898,56 @@ def parse_mus(data: bytes) -> MusFileData:
         ticks_per_beat, beats_per_measure, base_tempo,
         tempo_events, tracks, data_start, pos,
     )
+
+
+def audit_mus_loop_seam(data: bytes) -> dict[str, object]:
+    """Report control writes that occur at or after a voice's terminal note tick.
+
+    ED2's OPL driver consumes the control streams independently from the note
+    stream. A program/TL/pitch write on the same tick that a voice ends can
+    therefore touch a still-releasing operator immediately before the whole
+    song restarts. Generated files use this audit as a hard pop-safety check.
+    """
+    mus = parse_mus(data)
+    global_total = max(mus.totals[:mus.active_voices], default=0)
+    by_kind = {"instrument": 0, "volume": 0, "pitch": 0}
+    events: list[dict[str, int | str]] = []
+    zero_total_controls = 0
+
+    for ch in range(mus.active_voices):
+        total = mus.totals[ch]
+        track = mus.tracks[ch]
+        streams = (
+            ("instrument", track.instruments),
+            ("volume", track.volumes),
+            ("pitch", track.pitches),
+        )
+        for kind, stream in streams:
+            for ev in stream:
+                if total == 0:
+                    zero_total_controls += 1
+                    events.append({
+                        "channel": ch,
+                        "kind": kind,
+                        "time": ev.time,
+                        "channel_total": total,
+                    })
+                elif ev.time >= total:
+                    by_kind[kind] += 1
+                    events.append({
+                        "channel": ch,
+                        "kind": kind,
+                        "time": ev.time,
+                        "channel_total": total,
+                    })
+
+    return {
+        "global_total_ticks": global_total,
+        "terminal_control_events": sum(by_kind.values()),
+        "terminal_control_events_by_kind": by_kind,
+        "zero_total_voice_control_events": zero_total_controls,
+        "events": events,
+    }
 
 
 def load_mus_header(data: bytes) -> MusHeader:
@@ -1089,6 +1139,7 @@ VGM_SAMPLE_RATE = 44100.0
 ED2_DEFAULT_TICKS_PER_BEAT = 24
 ED2_DEFAULT_BASE_TEMPO = 150
 ED2_DEFAULT_BEATS_PER_MEASURE = 4
+ED2_RESTART_GUARD_DEFAULT_TICKS = 12
 ED2_VOLUME_MASTER = 114  # recovered from original ED2 MUS volume -> YM3812 TL pairs
 OPL_VIBRATO_HZ = 6.10
 OPL_VIBRATO_SHALLOW_CENTS = 7.0
@@ -1166,6 +1217,102 @@ def _vgm_data_offset(data: bytes) -> int:
 def _vgm_loop_file_offset(data: bytes) -> Optional[int]:
     rel = struct.unpack_from("<I", data, 0x1C)[0]
     return None if rel == 0 else 0x1C + rel
+
+
+@dataclass(frozen=True)
+class VgmTimingHint:
+    header_rate_hz: int
+    recommended_base_tempo: Optional[int]
+    recommended_tick_hz: Optional[float]
+    final_wait_samples: int
+    last_ym_write_sample: int
+    total_samples: int
+    recommended_end_trim_ticks: int
+    reason: Optional[str]
+
+
+def inspect_vgm_timing(path: Path, ticks_per_beat: int = ED2_DEFAULT_TICKS_PER_BEAT) -> VgmTimingHint:
+    """Recover the source scheduler rate and detect one terminal capture frame.
+
+    VGM captures made from ED2/compiled-ROL playback store the driver update
+    rate at header offset 0x24.  They can also end with one complete scheduler
+    wait after the final YM3812 write.  That wait belongs to the capture
+    container, not the MUS timeline; retaining it lengthens every final note by
+    one tick and makes the restart seam differ from the retail file.
+    """
+    if ticks_per_beat <= 0:
+        raise ValueError("ticks_per_beat must be > 0")
+    data = _read_vgm_bytes(path)
+    rate = struct.unpack_from("<I", data, 0x24)[0] if len(data) >= 0x28 else 0
+    pos = _vgm_data_offset(data)
+    sample = 0
+    last_ym_write_sample = 0
+    last_was_wait = False
+    final_wait = 0
+    final_wait_start = 0
+
+    while pos < len(data):
+        cmd = data[pos]
+        pos += 1
+        if cmd == 0x66:
+            break
+        wait = None
+        if cmd == 0x61:
+            if pos + 2 > len(data):
+                raise FormatError("truncated VGM wait")
+            wait = u16(data, pos)
+            pos += 2
+        elif cmd == 0x62:
+            wait = 735
+        elif cmd == 0x63:
+            wait = 882
+        elif 0x70 <= cmd <= 0x7F:
+            wait = (cmd & 0x0F) + 1
+        elif 0x80 <= cmd <= 0x8F:
+            wait = cmd & 0x0F
+        elif cmd == 0x5A:
+            if pos + 2 > len(data):
+                raise FormatError("truncated YM3812 write")
+            pos += 2
+            last_ym_write_sample = sample
+            last_was_wait = False
+            continue
+        else:
+            pos = _skip_vgm_command(data, pos, cmd)
+            if pos > len(data):
+                raise FormatError("VGM command runs past end of file")
+            last_was_wait = False
+            continue
+
+        final_wait_start = sample
+        final_wait = int(wait)
+        sample += int(wait)
+        last_was_wait = True
+
+    bpm: Optional[int] = None
+    tick_hz: Optional[float] = None
+    if 1 <= rate <= 1000:
+        candidate = int(math.floor(rate * 60.0 / ticks_per_beat + 0.5))
+        if 1 <= candidate <= 65535:
+            bpm = candidate
+            tick_hz = ticks_per_beat * candidate / 60.0
+
+    trim = 0
+    reason: Optional[str] = None
+    if last_was_wait and rate > 0 and tick_hz is not None:
+        one_frame = abs(final_wait - VGM_SAMPLE_RATE / rate) <= 1.0
+        one_tick = _quantize_sample(sample, tick_hz) - _quantize_sample(final_wait_start, tick_hz) == 1
+        if one_frame and one_tick and last_ym_write_sample == final_wait_start:
+            trim = 1
+            reason = (
+                f"the final {final_wait}-sample wait is one {rate} Hz capture frame "
+                "after the last YM3812 write"
+            )
+
+    return VgmTimingHint(
+        int(rate), bpm, tick_hz, int(final_wait if last_was_wait else 0),
+        int(last_ym_write_sample), int(sample), trim, reason,
+    )
 
 
 def _skip_vgm_command(data: bytes, pos: int, cmd: int) -> int:
@@ -1742,11 +1889,12 @@ def _opl_note_base_frequency(midi_note: int) -> float:
 def _pitch_value_for_frequency(midi_note: int, frequency: float) -> int:
     """Encode the ED2 compiled-ROL pitch word.
 
-    Retail DS2_07.MUS aligned against its captured VGM proves that the word is
-    a signed *semitone offset*, not an F-number multiplier.  0x1FFF is zero;
-    one full 0x2000 step is one semitone.  Common retail values therefore map
-    as 6539 ~= -0.20 st, 7333 ~= -0.10 st, 8984 ~= +0.10 st, and
-    9777 ~= +0.20 st.
+    The supplied retail DS2_07.MUS aligned against 08 Field.vgz confirms a
+    14-bit bipolar bend word with 0x1FFF as the neutral value and roughly one
+    semitone of travel to either end.  The VGM contains already-quantized OPL
+    F-numbers, so several nearby bend words can reproduce the same register
+    value; conversion targets the center of the observed frequency value rather
+    than claiming byte-identical recovery of the original authoring value.
     """
     base_freq = _opl_note_base_frequency(midi_note)
     if base_freq <= 0 or frequency <= 0:
@@ -1774,6 +1922,7 @@ def _build_vgm_pitch_tracks(
     active_voices: int,
     total_ticks: int,
     tick_hz: float,
+    bake_hardware_vibrato: bool = False,
 ) -> tuple[list[list[MusPitchEvent]], int]:
     """Reconstruct the effective VGM pitch curve at every MUS tick.
 
@@ -1783,9 +1932,11 @@ def _build_vgm_pitch_tracks(
     register write independently.  This preserves vibrato phase, portamento,
     fine pitch and note detune as closely as the MUS tick rate permits.
 
-    OPL hardware-VIB is not approximated here. Its operator VIB bits are kept
-    in the output INS, allowing the target YM3812 to reproduce the hardware LFO
-    natively. The ED2 driver uses a signed one-semitone fixed-point displacement (0..0x3FFE), with 0x1FFF as zero and 0x2000 units per semitone.
+    Direct A0/B0 motion is always imported. Hardware VIB can either remain in
+    the INS operator flags (the retail-compatible default) or be approximated
+    as an eight-step OPL LFO in the MUS pitch stream. Baking is useful as a
+    diagnostic on players that fail to honor the INS VIB bits; the generated
+    bank clears those bits to avoid applying vibrato twice.
     """
     tracks: list[list[MusPitchEvent]] = [
         [MusPitchEvent(0, MUS_BASE_PITCH)] for _ in range(MUS_VOICE_SLOTS)
@@ -1827,8 +1978,12 @@ def _build_vgm_pitch_tracks(
                 base_frequency = points[local_i].frequency
                 local_i += 1
 
-            # Furnace 04xy is already present in A0/B0 writes. Do not add an
-            # invented sine wave on top. Hardware VIB remains in the INS record.
+            if bake_hardware_vibrato and span.hardware_vibrato:
+                baked_notes += 1
+
+            # Furnace 04xy is already present in A0/B0 writes. Hardware VIB does
+            # not move those registers, so the optional bake adds only the OPL
+            # chip's own stepped LFO rather than duplicating tracker vibrato.
 
             # Sample-and-hold the exact register curve at the MUS scheduler's
             # tick boundaries.  This is the equivalent of importing Furnace's
@@ -1843,9 +1998,9 @@ def _build_vgm_pitch_tracks(
                     local_i += 1
 
                 # A0/B0 already contains Furnace pitch slide/portamento/04xy.
-                # Import that direct register curve only. Hardware VIB remains
-                # an INS flag and must not be added a second time here.
                 effective_frequency = base_frequency
+                if bake_hardware_vibrato and span.hardware_vibrato:
+                    effective_frequency *= _opl_vibrato_ratio(sample_at_tick, span.vibrato_deep)
                 tracks[ch].append(MusPitchEvent(
                     tick, _pitch_value_for_frequency(span.midi_note, effective_frequency)
                 ))
@@ -1859,46 +2014,124 @@ def _build_vgm_pitch_tracks(
     return [_coalesce_pitch(track) for track in tracks], baked_notes
 
 
+def _append_mus_rest(track: list[tuple[int, int]], duration: int) -> list[tuple[int, int]]:
+    """Append a rest to a compact MUS note stream, merging with a final rest."""
+    if duration <= 0:
+        return list(track)
+    out = list(track)
+    if out and out[-1][0] == 0:
+        note, old = out.pop()
+        out.extend(_split_mus_event(note, old + duration))
+    else:
+        out.extend(_split_mus_event(0, duration))
+    return out
+
+
+def _volume_at_tick(events: list[MusTimedByteEvent], tick: int, default: int = 127) -> int:
+    value = default
+    for ev in sorted(events, key=lambda e: e.time):
+        if ev.time > tick:
+            break
+        value = ev.value
+    return max(0, min(127, value))
+
+
+def _add_restart_guard_fade(
+    volume_tracks: list[list[MusTimedByteEvent]],
+    active_voices: int,
+    content_ticks: int,
+    restart_guard_ticks: int,
+) -> tuple[int, int, int]:
+    """Fade release tails to silence before ED2's hard OPL reset.
+
+    DRO capture of ED2's real restart path shows that the driver key-offs voices,
+    then clears/reinitializes almost the entire YM3812 register set only about one
+    scheduler tick later.  A release tail that is still audible is therefore
+    discontinuously rewritten.  The guard inserts a short post-key-off TL fade
+    and leaves several fully muted ticks before the terminal reset.
+    """
+    if restart_guard_ticks <= 0:
+        return 0, 0, 0
+    if restart_guard_ticks < 4:
+        raise ValueError("restart guard must be 0 or at least 4 ticks")
+
+    quiet_ticks = min(4, max(2, restart_guard_ticks // 3))
+    fade_ticks = restart_guard_ticks - quiet_ticks
+    if fade_ticks < 2:
+        fade_ticks = 2
+        quiet_ticks = restart_guard_ticks - fade_ticks
+
+    inserted = 0
+    for ch in range(active_voices):
+        start_volume = _volume_at_tick(volume_tracks[ch], content_ticks, default=127)
+        for step in range(1, fade_ticks + 1):
+            # Quadratic attenuation keeps the first TL steps small and reaches
+            # true silence (MUS volume 0 -> carrier TL 63) before the hard reset.
+            ratio = max(0.0, 1.0 - step / fade_ticks)
+            value = int(math.floor(start_volume * ratio * ratio + 0.5))
+            volume_tracks[ch].append(MusTimedByteEvent(content_ticks + step, value))
+            inserted += 1
+        volume_tracks[ch] = _coalesce_timed_byte(volume_tracks[ch])
+
+    return fade_ticks, quiet_ticks, inserted
+
+
 def make_ed2_pair_from_vgm(
     vgm: VgmAnalysis,
     ticks_per_beat: int = ED2_DEFAULT_TICKS_PER_BEAT,
     base_tempo: int = ED2_DEFAULT_BASE_TEMPO,
     beats_per_measure: int = ED2_DEFAULT_BEATS_PER_MEASURE,
     end_trim_ticks: int = 0,
+    restart_guard_ticks: int = ED2_RESTART_GUARD_DEFAULT_TICKS,
+    vibrato_mode: str = "native",
+    ed2_loop_seam: bool = True,
+    legacy_terminal_preload: bool = False,
 ) -> tuple[bytes, bytes, dict[str, object]]:
     if ticks_per_beat <= 0 or base_tempo <= 0:
         raise ValueError("ticks_per_beat and base_tempo must be > 0")
     tick_hz = ticks_per_beat * base_tempo / 60.0
     raw_total_ticks = max(1, _quantize_sample(vgm.total_samples, tick_hz))
     end_trim_ticks = int(end_trim_ticks)
+    restart_guard_ticks = int(restart_guard_ticks)
     if end_trim_ticks < 0:
         raise ValueError("end trim ticks must be 0 or greater")
     if end_trim_ticks >= raw_total_ticks:
         raise ValueError(
             f"end trim ticks ({end_trim_ticks}) must be smaller than the generated length ({raw_total_ticks} ticks)"
         )
-    total_ticks = raw_total_ticks - end_trim_ticks
+    if restart_guard_ticks < 0:
+        raise ValueError("restart guard ticks must be 0 or greater")
+    if 0 < restart_guard_ticks < 4:
+        raise ValueError("restart guard ticks must be 0 or at least 4")
+
+    content_ticks = raw_total_ticks - end_trim_ticks
+    # The diagnostic/compatibility equal-track mode deliberately disables the
+    # new DRO-verified guard.  The normal GUI/CLI default leaves it enabled.
+    if not ed2_loop_seam and not legacy_terminal_preload:
+        restart_guard_ticks = 0
+    total_ticks = content_ticks + restart_guard_ticks
     if total_ticks > 65535:
         raise ValueError(
-            f"song is too long for the 16-bit MUS timeline ({total_ticks} ticks); "
-            "lower ticks/beat or base tempo"
+            f"song plus restart guard is too long for the 16-bit MUS timeline ({total_ticks} ticks); "
+            "lower ticks/beat, base tempo, trim the end, or reduce the guard"
         )
+
+    vibrato_mode = vibrato_mode.strip().lower()
+    if vibrato_mode not in ("native", "bake"):
+        raise ValueError("vibrato_mode must be native or bake")
+    bake_hardware_vibrato = vibrato_mode == "bake"
 
     active_voices = 11 if vgm.rhythm_mode else 9
     used_voices = range(active_voices)
 
-    # Build a global instrument bank and channel program-change streams from the
-    # timbre seen at each note-on.  Normalized TL avoids treating volume changes
-    # as new instruments.
     instrument_index: dict[bytes, int] = {}
     bank: list[bytes] = []
     instrument_tracks: list[list[MusTimedByteEvent]] = [[] for _ in range(MUS_VOICE_SLOTS)]
     for ch in used_voices:
         last_idx: Optional[int] = None
         for span in sorted((n for n in vgm.notes if n.channel == ch), key=lambda n: n.start_sample):
-            # Preserve the source instrument exactly. Direct A0/B0 bends are
-            # imported independently; do not alter timbre flags while doing so.
-            inst = span.instrument
+            inst = (_clear_ins_hardware_vibrato(span.instrument)
+                    if bake_hardware_vibrato else span.instrument)
             idx = instrument_index.get(inst)
             if idx is None:
                 idx = len(bank)
@@ -1906,48 +2139,111 @@ def make_ed2_pair_from_vgm(
                     raise ValueError("VGM requires more than 256 distinct timbres; MUS program index is one byte")
                 instrument_index[inst] = idx
                 bank.append(inst)
-            tick = min(total_ticks, _quantize_sample(span.start_sample, tick_hz))
+            tick = min(content_ticks, _quantize_sample(span.start_sample, tick_hz))
             if idx != last_idx:
                 instrument_tracks[ch].append(MusTimedByteEvent(tick, idx))
                 last_idx = idx
 
     if not bank:
         bank.append(bytes(28))
+    seam_preloads = 0
     for ch in range(MUS_VOICE_SLOTS):
-        # Events exactly at the new end tick belong to the discarded VGM
-        # pre-roll copy and would be replayed again at MUS tick 0.
-        instrument_tracks[ch] = [ev for ev in instrument_tracks[ch] if ev.time < total_ticks]
-        if not instrument_tracks[ch]:
-            instrument_tracks[ch] = [MusTimedByteEvent(0, 0)]
-        else:
-            instrument_tracks[ch] = _coalesce_timed_byte(instrument_tracks[ch])
+        instrument_tracks[ch] = [
+            ev for ev in _coalesce_timed_byte(instrument_tracks[ch])
+            if ev.time < content_ticks
+        ]
 
     note_tracks: list[list[tuple[int, int]]] = [[] for _ in range(MUS_VOICE_SLOTS)]
     totals = [0] * MUS_VOICE_SLOTS
+    natural_short_channels = 0
     for ch in used_voices:
-        totals[ch] = total_ticks
-        note_tracks[ch] = _vgm_note_track(vgm, ch, total_ticks, tick_hz)
+        if restart_guard_ticks > 0:
+            # All active streams run through the quiet guard.  This guarantees
+            # that volume events can mute every operator before the driver reset.
+            totals[ch] = total_ticks
+            base_track = _vgm_note_track(vgm, ch, content_ticks, tick_hz)
+            note_tracks[ch] = _append_mus_rest(base_track, restart_guard_ticks)
+        else:
+            channel_total = content_ticks
+            if ed2_loop_seam:
+                spans = [n for n in vgm.notes if n.channel == ch]
+                if spans:
+                    last_end = max(min(content_ticks, _quantize_sample(n.end_sample, tick_hz)) for n in spans)
+                    if 0 < last_end < content_ticks:
+                        channel_total = last_end
+                        natural_short_channels += 1
+            totals[ch] = channel_total
+            note_tracks[ch] = _vgm_note_track(vgm, ch, channel_total, tick_hz)
 
-    # Reconstruct compact MUS volume values from live OPL Total Level.  ED2's
-    # integer TL scaling was recovered by comparing the supplied original MUS
-    # volume events against the captured YM3812 register stream.
     volume_tracks: list[list[MusTimedByteEvent]] = [[] for _ in range(MUS_VOICE_SLOTS)]
     for point in vgm.volume_points:
         if point.channel >= active_voices:
             continue
-        tick = min(total_ticks, _quantize_sample(point.sample, tick_hz))
+        tick = min(content_ticks, _quantize_sample(point.sample, tick_hz))
         volume_tracks[point.channel].append(MusTimedByteEvent(tick, point.volume))
     for ch in range(MUS_VOICE_SLOTS):
         volume_tracks[ch].insert(0, MusTimedByteEvent(0, 127))
-        volume_tracks[ch] = [ev for ev in _coalesce_timed_byte(volume_tracks[ch]) if ev.time < total_ticks]
+        volume_tracks[ch] = [
+            ev for ev in _coalesce_timed_byte(volume_tracks[ch])
+            if ev.time < content_ticks
+        ]
+
+    restart_fade_ticks = 0
+    restart_quiet_ticks = 0
+    restart_guard_volume_events = 0
+    if restart_guard_ticks > 0:
+        restart_fade_ticks, restart_quiet_ticks, restart_guard_volume_events = _add_restart_guard_fade(
+            volume_tracks, active_voices, content_ticks, restart_guard_ticks
+        )
 
     pitch_tracks, baked_hardware_vibrato_notes = _build_vgm_pitch_tracks(
-        vgm, active_voices, total_ticks, tick_hz
+        vgm, active_voices, content_ticks, tick_hz,
+        bake_hardware_vibrato=bake_hardware_vibrato,
     )
     pitch_tracks = [
-        [ev for ev in track if ev.time < total_ticks]
+        [ev for ev in track if ev.time < content_ticks]
         for track in pitch_tracks
     ]
+
+    removed_terminal = {"instrument": 0, "volume": 0, "pitch": 0}
+    for ch in range(MUS_VOICE_SLOTS):
+        cutoff = totals[ch]
+        if cutoff <= 0:
+            removed_terminal["instrument"] += len(instrument_tracks[ch])
+            removed_terminal["volume"] += len(volume_tracks[ch])
+            removed_terminal["pitch"] += len(pitch_tracks[ch])
+            instrument_tracks[ch] = []
+            volume_tracks[ch] = []
+            pitch_tracks[ch] = []
+            continue
+
+        first_program = instrument_tracks[ch][0].value if instrument_tracks[ch] else 0
+        kept_inst = [ev for ev in instrument_tracks[ch] if ev.time < cutoff]
+        removed_terminal["instrument"] += len(instrument_tracks[ch]) - len(kept_inst)
+        if not kept_inst:
+            kept_inst = [MusTimedByteEvent(0, first_program)]
+        elif kept_inst[0].time > 0:
+            kept_inst.insert(0, MusTimedByteEvent(0, kept_inst[0].value))
+        instrument_tracks[ch] = _coalesce_timed_byte(kept_inst)
+
+        kept_vol = [ev for ev in volume_tracks[ch] if ev.time < cutoff]
+        removed_terminal["volume"] += len(volume_tracks[ch]) - len(kept_vol)
+        if not kept_vol:
+            kept_vol = [MusTimedByteEvent(0, 127)]
+        volume_tracks[ch] = _coalesce_timed_byte(kept_vol)
+
+        kept_pitch = [ev for ev in pitch_tracks[ch] if ev.time < cutoff]
+        removed_terminal["pitch"] += len(pitch_tracks[ch]) - len(kept_pitch)
+        pitch_tracks[ch] = _coalesce_pitch(kept_pitch)
+
+    if legacy_terminal_preload:
+        for ch in range(active_voices):
+            if (totals[ch] > 0 and instrument_tracks[ch]
+                    and instrument_tracks[ch][-1].value != instrument_tracks[ch][0].value):
+                instrument_tracks[ch].append(
+                    MusTimedByteEvent(total_ticks, instrument_tracks[ch][0].value)
+                )
+                seam_preloads += 1
 
     mus_data = build_mus(
         active_voices, totals, note_tracks, instrument_tracks,
@@ -1958,6 +2254,20 @@ def make_ed2_pair_from_vgm(
         tempo_events=[MusTempoEvent(0, 100)],
     )
 
+    seam_audit = audit_mus_loop_seam(mus_data)
+    if not legacy_terminal_preload and (
+        seam_audit["terminal_control_events"] != 0
+        or seam_audit["zero_total_voice_control_events"] != 0
+    ):
+        raise ValueError("generated MUS failed pop-safe loop seam validation")
+
+    guard_final_volumes = [
+        _volume_at_tick(volume_tracks[ch], total_ticks - 1, default=127)
+        for ch in range(active_voices)
+    ]
+    if restart_guard_ticks > 0 and any(v != 0 for v in guard_final_volumes):
+        raise ValueError("restart guard validation failed: one or more voices are not fully muted")
+
     ins = bytearray(struct.pack("<H", len(bank)))
     for rec in bank:
         ins += rec
@@ -1966,15 +2276,43 @@ def make_ed2_pair_from_vgm(
         "active_voices": active_voices,
         "rhythm_mode": vgm.rhythm_mode,
         "source_pitch_points": len(vgm.pitch_points),
-        "hardware_vibrato_notes_baked": 0,
-        "hardware_vibrato_mode": "source INS VIB bits preserved; no invented LFO added to direct A0/B0 pitch",
+        "hardware_vibrato_notes_baked": baked_hardware_vibrato_notes,
+        "hardware_vibrato_mode": (
+            "OPL VIB approximated in MUS pitch; output INS VIB bits cleared"
+            if bake_hardware_vibrato else
+            "retail-compatible native INS VIB bits preserved; direct A0/B0 pitch imported"
+        ),
+        "ed2_loop_seam": bool(ed2_loop_seam),
+        "loop_seam_mode": (
+            "legacy v0.6.5 terminal instrument preload (diagnostic)"
+            if legacy_terminal_preload else
+            (
+                "DRO-verified release fade + silent restart guard"
+                if restart_guard_ticks > 0 else
+                ("pop-safe natural channel ends" if ed2_loop_seam else "pop-safe equal-length tracks")
+            )
+        ),
+        "legacy_terminal_preload": bool(legacy_terminal_preload),
+        "loop_instrument_preloads": seam_preloads,
+        "terminal_control_events_removed": sum(removed_terminal.values()),
+        "terminal_control_events_removed_by_kind": removed_terminal,
+        "loop_seam_audit": seam_audit,
+        "natural_short_channel_totals": natural_short_channels,
+        "channel_totals": totals[:active_voices],
         "generated_pitch_events": sum(len(track) for track in pitch_tracks),
         "ticks_per_beat": ticks_per_beat,
         "base_tempo_bpm": base_tempo,
         "beats_per_measure": beats_per_measure,
         "tick_hz": round(tick_hz, 6),
         "raw_total_ticks": raw_total_ticks,
+        "content_ticks": content_ticks,
         "end_trim_ticks": end_trim_ticks,
+        "restart_guard_ticks": restart_guard_ticks,
+        "restart_guard_seconds": round(restart_guard_ticks / tick_hz, 6),
+        "restart_fade_ticks": restart_fade_ticks,
+        "restart_quiet_ticks": restart_quiet_ticks,
+        "restart_guard_volume_events": restart_guard_volume_events,
+        "restart_guard_final_volumes": guard_final_volumes,
         "total_ticks": total_ticks,
         "instrument_count": len(bank),
         "instrument_events": sum(len(x) for x in instrument_tracks[:active_voices]),
@@ -1992,7 +2330,6 @@ def make_ed2_pair_from_vgm(
     }
     return mus_data, bytes(ins), report
 
-
 def convert_vgm_to_ed2_pair(
     vgm_path: Path,
     out_mus: Path,
@@ -2003,6 +2340,10 @@ def convert_vgm_to_ed2_pair(
     make_backup: bool = True,
     loop_mode: str = "full",
     end_trim_ticks: int = 0,
+    restart_guard_ticks: int = ED2_RESTART_GUARD_DEFAULT_TICKS,
+    vibrato_mode: str = "native",
+    ed2_loop_seam: bool = True,
+    legacy_terminal_preload: bool = False,
 ) -> dict[str, object]:
     analysis = analyze_vgm(vgm_path)
     if analysis.ym3812_writes == 0:
@@ -2038,6 +2379,10 @@ def convert_vgm_to_ed2_pair(
         analysis, ticks_per_beat=ticks_per_beat,
         base_tempo=base_tempo, beats_per_measure=beats_per_measure,
         end_trim_ticks=end_trim_ticks,
+        restart_guard_ticks=restart_guard_ticks,
+        vibrato_mode=vibrato_mode,
+        ed2_loop_seam=ed2_loop_seam,
+        legacy_terminal_preload=legacy_terminal_preload,
     )
     atomic_write(out_mus, mus_data, make_backup=make_backup and out_mus.exists())
     atomic_write(out_ins, ins_data, make_backup=make_backup and out_ins.exists())
@@ -2059,14 +2404,21 @@ def convert_vgm_to_ed2_pair(
         "generated_loop_tick": 0 if effective_mode == "vgm" else None,
         "end_trim_ticks": end_trim_ticks,
         "end_trim_reason": trim_reason,
+        "restart_guard_ticks_requested": int(restart_guard_ticks),
         "loop_note": (
             "VGM loop body moved to MUS tick 0; ED2 whole-song restart becomes the VGM loop. "
             "A one-time intro plus arbitrary partial loop requires an ED2 playback executable patch."
             if effective_mode == "vgm" else
             (
-                f"Full source timeline retained with {end_trim_ticks} user-selected end tick(s) removed; ED2 repeats from MUS tick 0."
+                (
+                    f"Full source timeline retained with {end_trim_ticks} user-selected end tick(s) removed; "
+                    f"{int(restart_guard_ticks)} restart-guard tick(s) added; ED2 repeats from MUS tick 0."
+                )
                 if end_trim_ticks else
-                "Full source timeline retained; ED2 repeats from MUS tick 0."
+                (
+                    f"Full source timeline retained; {int(restart_guard_ticks)} restart-guard tick(s) added; "
+                    "ED2 repeats from MUS tick 0."
+                )
             )
         ),
         "channel_note_counts": analysis.channel_note_counts,
@@ -2075,6 +2427,257 @@ def convert_vgm_to_ed2_pair(
         "parser_roundtrip_ok": parsed.end_offset == len(mus_data),
         **detail,
     }
+
+
+# ---------------------------------------------------------------------------
+# DOSBox DRO v2 loop-restart audit
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DroWriteEvent:
+    time_ms: int
+    pair_index: int
+    chip: int
+    register: int
+    value: int
+
+
+def parse_dro_v2(path: Path) -> tuple[dict[str, int | str], list[DroWriteEvent]]:
+    data = path.read_bytes()
+    if len(data) < 26 or data[:8] != b"DBRAWOPL":
+        raise FormatError("not a DOSBox Raw OPL file")
+    major = u16(data, 8)
+    minor = u16(data, 10)
+    if (major, minor) != (2, 0):
+        raise FormatError(f"only DRO v2.0 is supported, got {major}.{minor}")
+
+    pair_count = struct.unpack_from("<I", data, 12)[0]
+    length_ms = struct.unpack_from("<I", data, 16)[0]
+    hardware, fmt, compression, short_code, long_code, map_len = struct.unpack_from("<6B", data, 20)
+    if fmt != 0 or compression != 0:
+        raise FormatError("unsupported DRO v2 format/compression")
+    map_start = 26
+    stream_start = map_start + map_len
+    if stream_start > len(data):
+        raise FormatError("truncated DRO code map")
+    code_map = data[map_start:stream_start]
+    stream = data[stream_start:]
+    if len(stream) != pair_count * 2:
+        raise FormatError(
+            f"DRO pair count mismatch: header={pair_count}, stream={len(stream) // 2}"
+        )
+
+    time_ms = 0
+    writes: list[DroWriteEvent] = []
+    for pair_index in range(pair_count):
+        code = stream[pair_index * 2]
+        value = stream[pair_index * 2 + 1]
+        if code == short_code:
+            time_ms += value + 1
+            continue
+        if code == long_code:
+            time_ms += (value + 1) * 256
+            continue
+        chip = 1 if code & 0x80 else 0
+        map_index = code & 0x7F
+        if map_index >= len(code_map):
+            raise FormatError(f"DRO code-map index {map_index} is out of range")
+        writes.append(DroWriteEvent(time_ms, pair_index, chip, code_map[map_index], value))
+
+    if time_ms != length_ms:
+        raise FormatError(f"DRO duration mismatch: header={length_ms}, decoded={time_ms}")
+
+    return {
+        "signature": "DBRAWOPL",
+        "version": f"{major}.{minor}",
+        "pair_count": pair_count,
+        "length_ms": length_ms,
+        "hardware_type": hardware,
+        "format": fmt,
+        "compression": compression,
+        "short_delay_code": short_code,
+        "long_delay_code": long_code,
+        "code_map_length": map_len,
+        "write_count": len(writes),
+    }, writes
+
+
+def audit_dro_loop_restart(path: Path) -> dict[str, object]:
+    header, writes = parse_dro_v2(path)
+    if not writes:
+        raise FormatError("DRO contains no OPL writes")
+
+    # Find a restart/reset burst: a short window that clears most of the low-bank
+    # YM3812 register state. ED2's captured loop performs this immediately after
+    # key-off, which is the destructive seam seen in the supplied recording.
+    reset_candidate: Optional[tuple[int, int, int]] = None
+    left = 0
+    zero_core_regs = {
+        0x01, 0x08, 0xBD,
+        *range(0x20, 0x36), *range(0x40, 0x56),
+        *range(0x60, 0x76), *range(0x80, 0x96),
+        *range(0xA0, 0xA9), *range(0xB0, 0xB9), *range(0xC0, 0xC9),
+        *range(0xE0, 0xF6),
+    }
+    for right, ev in enumerate(writes):
+        while writes[left].time_ms < ev.time_ms - 12:
+            left += 1
+        window = writes[left:right + 1]
+        zero_count = sum(
+            1 for w in window
+            if w.chip == 0 and w.register in zero_core_regs and w.value == 0
+        )
+        distinct = len({
+            w.register for w in window
+            if w.chip == 0 and w.register in zero_core_regs and w.value == 0
+        })
+        if zero_count >= 70 and distinct >= 65:
+            reset_candidate = (window[0].time_ms, ev.time_ms, left)
+            break
+    if reset_candidate is None:
+        raise FormatError("no ED2-style hard OPL restart burst was detected")
+
+    reset_window_start, reset_window_end, reset_left = reset_candidate
+    # Expand to the first write in the nearby stop/restart sequence.
+    sequence_start = max(0, reset_window_start - 40)
+    sequence_end = reset_window_end + 40
+    sequence = [w for w in writes if sequence_start <= w.time_ms <= sequence_end]
+
+    melodic_state = [False] * 9
+    rhythm_state = 0
+    transitions: list[dict[str, int | str]] = []
+    for w in writes:
+        if w.chip != 0:
+            continue
+        if 0xB0 <= w.register <= 0xB8:
+            ch = w.register - 0xB0
+            on = bool(w.value & 0x20)
+            if on != melodic_state[ch]:
+                transitions.append({
+                    "time_ms": w.time_ms,
+                    "kind": "key_on" if on else "key_off",
+                    "channel": ch,
+                    "register": w.register,
+                    "value": w.value,
+                })
+                melodic_state[ch] = on
+        elif w.register == 0xBD:
+            new_rhythm = w.value & 0x1F
+            changed = rhythm_state ^ new_rhythm
+            for bit, name in enumerate(("hi_hat", "cymbal", "tom", "snare", "bass_drum")):
+                if changed & (1 << bit):
+                    transitions.append({
+                        "time_ms": w.time_ms,
+                        "kind": "rhythm_on" if new_rhythm & (1 << bit) else "rhythm_off",
+                        "channel": name,
+                        "register": 0xBD,
+                        "value": w.value,
+                    })
+            rhythm_state = new_rhythm
+
+    pre = [x for x in transitions if reset_window_start - 40 <= int(x["time_ms"]) <= reset_window_start + 2]
+    post = [x for x in transitions if reset_window_end <= int(x["time_ms"]) <= reset_window_end + 80]
+    # Use the final key-off cluster that begins the hard reset. Earlier same-tick
+    # off/on retriggers are ordinary note articulation, not the loop seam.
+    keyoffs = [
+        x for x in pre
+        if x["kind"] in ("key_off", "rhythm_off")
+        and int(x["time_ms"]) >= reset_window_start
+    ]
+    if not keyoffs:
+        keyoffs = [x for x in pre if x["kind"] in ("key_off", "rhythm_off")]
+    first_key_off_ms = min((int(x["time_ms"]) for x in keyoffs), default=None)
+    keyons_before = [
+        x for x in transitions
+        if x["kind"] in ("key_on", "rhythm_on")
+        and (first_key_off_ms is None or int(x["time_ms"]) < first_key_off_ms)
+    ]
+    keyons_after = [x for x in transitions if x["kind"] in ("key_on", "rhythm_on") and int(x["time_ms"]) >= reset_window_end]
+    last_key_on_ms = max((int(x["time_ms"]) for x in keyons_before), default=None)
+    first_restart_key_on_ms = min((int(x["time_ms"]) for x in keyons_after), default=None)
+
+    destructive_regs = {
+        *range(0x20, 0x36), *range(0x40, 0x56),
+        *range(0x60, 0x76), *range(0x80, 0x96),
+        *range(0xC0, 0xC9), *range(0xE0, 0xF6),
+        0x01, 0x08, 0xBD,
+    }
+    destructive_writes = [
+        w for w in writes
+        if first_key_off_ms is not None
+        and first_key_off_ms <= w.time_ms <= (first_restart_key_on_ms or reset_window_end)
+        and w.chip == 0 and w.register in destructive_regs
+    ]
+    zero_writes = [w for w in destructive_writes if w.value == 0]
+    tl_writes = [w for w in destructive_writes if 0x40 <= w.register <= 0x55]
+
+    risk = (
+        first_key_off_ms is not None
+        and first_restart_key_on_ms is not None
+        and first_restart_key_on_ms - first_key_off_ms < 100
+        and len(destructive_writes) >= 60
+    )
+
+    boundary_rows = [
+        {
+            "time_ms": w.time_ms,
+            "relative_ms": w.time_ms - reset_window_start,
+            "pair_index": w.pair_index,
+            "chip": w.chip,
+            "register_hex": f"{w.register:02X}",
+            "value_hex": f"{w.value:02X}",
+            "category": (
+                "key/frequency" if 0xA0 <= w.register <= 0xB8 else
+                "total_level" if 0x40 <= w.register <= 0x55 else
+                "operator" if (0x20 <= w.register <= 0x95 or 0xE0 <= w.register <= 0xF5) else
+                "rhythm/global" if w.register in (0x01, 0x08, 0xBD) else
+                "other"
+            ),
+        }
+        for w in sequence
+    ]
+
+    return {
+        "file": str(path),
+        "header": header,
+        "hard_restart_detected": True,
+        "restart_risk_detected": risk,
+        "reset_window_start_ms": reset_window_start,
+        "reset_window_end_ms": reset_window_end,
+        "last_key_on_before_reset_ms": last_key_on_ms,
+        "first_key_off_ms": first_key_off_ms,
+        "first_restart_key_on_ms": first_restart_key_on_ms,
+        "last_note_to_keyoff_ms": (
+            None if last_key_on_ms is None or first_key_off_ms is None
+            else first_key_off_ms - last_key_on_ms
+        ),
+        "keyoff_to_restart_keyon_ms": (
+            None if first_key_off_ms is None or first_restart_key_on_ms is None
+            else first_restart_key_on_ms - first_key_off_ms
+        ),
+        "destructive_register_writes_between_keyoff_and_restart": len(destructive_writes),
+        "zero_register_writes_between_keyoff_and_restart": len(zero_writes),
+        "total_level_writes_between_keyoff_and_restart": len(tl_writes),
+        "keyoff_transitions_near_reset": keyoffs,
+        "restart_transitions": post,
+        "boundary_rows": boundary_rows,
+        "finding": (
+            "The capture proves that ED2 performs a hard YM3812 stop/reset/reload at the song restart. "
+            "The final notes are key-offed only one scheduler interval before operator, TL, envelope, "
+            "waveform, feedback and rhythm registers are rewritten. Reducing the source end does not "
+            "remove this reset; the converted MUS must reach volume 0 and remain silent before its terminal tick."
+        ),
+    }
+
+
+def write_dro_boundary_csv(report: dict[str, object], out_path: Path) -> int:
+    rows = list(report.get("boundary_rows", []))
+    fields = ["time_ms", "relative_ms", "pair_index", "chip", "register_hex", "value_hex", "category"]
+    with out_path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)
 
 # ---------------------------------------------------------------------------
 # Analysis/report
@@ -2758,7 +3361,7 @@ def run_gui(initial_root: Optional[Path] = None) -> None:
             ttk.Label(tab, text="Ticks / beat").grid(row=3, column=0, sticky="w", pady=(7, 0))
             self.vgm_tpb_var = tk.StringVar(value=str(ED2_DEFAULT_TICKS_PER_BEAT))
             ttk.Entry(tab, textvariable=self.vgm_tpb_var, width=10).grid(row=3, column=1, sticky="w", padx=6, pady=(7, 0))
-            ttk.Label(tab, text="24 with BPM 150 = 60 MUS ticks/sec").grid(row=3, column=2, columnspan=2, sticky="w", pady=(7, 0))
+            ttk.Label(tab, text="Analyze VGM auto-fills the source update rate (for example 100 Hz -> BPM 250)").grid(row=3, column=2, columnspan=2, sticky="w", pady=(7, 0))
 
             ttk.Label(tab, text="Base tempo BPM").grid(row=4, column=0, sticky="w", pady=(7, 0))
             self.vgm_bpm_var = tk.StringVar(value=str(ED2_DEFAULT_BASE_TEMPO))
@@ -2769,7 +3372,7 @@ def run_gui(initial_root: Optional[Path] = None) -> None:
             ttk.Entry(tab, textvariable=self.vgm_beats_var, width=10).grid(row=5, column=1, sticky="w", padx=6, pady=(7, 0))
 
             ttk.Label(tab, text="Loop handling").grid(row=6, column=0, sticky="w", pady=(7, 0))
-            self.vgm_loop_var = tk.StringVar(value="VGM loop body (seamless)")
+            self.vgm_loop_var = tk.StringVar(value="Full song (restart from beginning)")
             ttk.Combobox(
                 tab, textvariable=self.vgm_loop_var, state="readonly",
                 values=("VGM loop body (seamless)", "Full song (restart from beginning)"),
@@ -2780,15 +3383,42 @@ def run_gui(initial_root: Optional[Path] = None) -> None:
             ttk.Label(tab, text="Reduce end ticks").grid(row=7, column=0, sticky="w", pady=(7, 0))
             self.vgm_end_trim_var = tk.StringVar(value="0")
             ttk.Entry(tab, textvariable=self.vgm_end_trim_var, width=10).grid(row=7, column=1, sticky="w", padx=6, pady=(7, 0))
-            ttk.Label(tab, text="0 = no trim; removes notes and control events at the new end").grid(row=7, column=2, columnspan=2, sticky="w", pady=(7, 0))
+            ttk.Label(tab, text="Removes a capture-only tail; shortening this does not prevent ED2's hard OPL restart").grid(row=7, column=2, columnspan=2, sticky="w", pady=(7, 0))
+
+            ttk.Label(tab, text="Restart guard ticks").grid(row=8, column=0, sticky="w", pady=(7, 0))
+            self.vgm_restart_guard_var = tk.StringVar(value=str(ED2_RESTART_GUARD_DEFAULT_TICKS))
+            ttk.Entry(tab, textvariable=self.vgm_restart_guard_var, width=10).grid(row=8, column=1, sticky="w", padx=6, pady=(7, 0))
+            ttk.Label(tab, text="Post-key-off fade + fully muted ticks before ED2 clears YM3812 registers; use 0 only for diagnosis").grid(row=8, column=2, columnspan=2, sticky="w", pady=(7, 0))
+
+            ttk.Label(tab, text="Hardware vibrato").grid(row=9, column=0, sticky="w", pady=(7, 0))
+            self.vgm_vibrato_var = tk.StringVar(value="Native INS VIB (retail-compatible)")
+            ttk.Combobox(
+                tab, textvariable=self.vgm_vibrato_var, state="readonly",
+                values=("Native INS VIB (retail-compatible)", "Bake VIB into MUS pitch (diagnostic)"),
+                width=38,
+            ).grid(row=9, column=1, columnspan=2, sticky="w", padx=6, pady=(7, 0))
+            ttk.Label(tab, text="Direct A0/B0 bends are imported in both modes.").grid(row=9, column=3, sticky="w", pady=(7, 0))
+
+            ttk.Label(tab, text="Loop seam").grid(row=10, column=0, sticky="w", pady=(7, 0))
+            self.vgm_seam_var = tk.StringVar(value="DRO-verified restart guard (recommended)")
+            ttk.Combobox(
+                tab, textvariable=self.vgm_seam_var, state="readonly",
+                values=(
+                    "DRO-verified restart guard (recommended)",
+                    "No restart guard / equal-length tracks (diagnostic)",
+                    "Legacy v0.6.5 terminal preload (diagnostic)",
+                ),
+                width=43,
+            ).grid(row=10, column=1, columnspan=2, sticky="w", padx=6, pady=(7, 0))
+            ttk.Label(tab, text="Fades release tails to volume 0 before ED2 performs its hard register reset.").grid(row=10, column=3, sticky="w", pady=(7, 0))
 
             buttons = ttk.Frame(tab)
-            buttons.grid(row=8, column=0, columnspan=4, sticky="ew", pady=12)
+            buttons.grid(row=11, column=0, columnspan=4, sticky="ew", pady=12)
             ttk.Button(buttons, text="Analyze VGM", command=self.vgm_analyze).pack(side="left")
             ttk.Button(buttons, text="Convert + Apply to game", command=self.vgm_convert_apply).pack(side="left", padx=6)
 
             info = ttk.LabelFrame(tab, text="VGM analysis", padding=8)
-            info.grid(row=9, column=0, columnspan=4, sticky="nsew")
+            info.grid(row=12, column=0, columnspan=4, sticky="nsew")
             self.vgm_info = tk.Text(info, height=20, wrap="word")
             self.vgm_info.pack(fill="both", expand=True)
             self.vgm_info.insert("1.0", "Choose a VGM/VGZ file and click Analyze VGM.\n")
@@ -2797,12 +3427,12 @@ def run_gui(initial_root: Optional[Path] = None) -> None:
             warn = (
                 "v0.5 can use the VGM loop marker by moving the loop body to MUS tick 0. This creates a seamless ED2 whole-song loop, "
                 "but a one-time intro plus an arbitrary partial loop is not representable in the compiled ROL/MUS file itself. Full-song mode preserves the intro and restarts at tick 0. "
-                "Existing target files receive one-time .bak backups."
+                "The restart guard adds a short muted tail because ED2 hard-resets YM3812 at every whole-song restart. Existing target files receive one-time .bak backups."
             )
-            ttk.Label(tab, text=warn, wraplength=980, justify="left").grid(row=10, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+            ttk.Label(tab, text=warn, wraplength=980, justify="left").grid(row=13, column=0, columnspan=4, sticky="ew", pady=(10, 0))
             tab.columnconfigure(1, weight=1)
             tab.columnconfigure(2, weight=1)
-            tab.rowconfigure(9, weight=1)
+            tab.rowconfigure(12, weight=1)
 
         def _populate_vgm_templates(self) -> None:
             """Historical name kept because set_root() already calls it; now fills target names only."""
@@ -2835,6 +3465,22 @@ def run_gui(initial_root: Optional[Path] = None) -> None:
             try:
                 path = Path(text)
                 a = analyze_vgm(path)
+                tpb_hint = int(self.vgm_tpb_var.get().strip(), 0)
+                timing_hint = inspect_vgm_timing(path, tpb_hint)
+                if timing_hint.recommended_base_tempo is not None:
+                    self.vgm_bpm_var.set(str(timing_hint.recommended_base_tempo))
+                self.vgm_end_trim_var.set(str(timing_hint.recommended_end_trim_ticks))
+                guard_rate = timing_hint.recommended_tick_hz
+                if guard_rate is None:
+                    try:
+                        guard_rate = tpb_hint * int(self.vgm_bpm_var.get().strip(), 0) / 60.0
+                    except Exception:
+                        guard_rate = 60.0
+                self.vgm_restart_guard_var.set(str(max(4, int(math.ceil(guard_rate * 0.20)))))
+                self.vgm_loop_var.set(
+                    "VGM loop body (seamless)" if a.loop_sample is not None
+                    else "Full song (restart from beginning)"
+                )
                 self.vgm_path = path
                 self.vgm_analysis = a
                 names = ["Melodic 1", "Melodic 2", "Melodic 3", "Melodic 4", "Melodic 5", "Melodic 6",
@@ -2842,6 +3488,12 @@ def run_gui(initial_root: Optional[Path] = None) -> None:
                 lines = [
                     f"File: {path.name}",
                     f"Duration: {a.duration_seconds:.3f} sec",
+                    f"VGM header update rate: {timing_hint.header_rate_hz or 'not set'} Hz",
+                    f"Recommended timing: {tpb_hint} TPB / {timing_hint.recommended_base_tempo or 'manual'} BPM"
+                    + (f" = {timing_hint.recommended_tick_hz:g} ticks/sec" if timing_hint.recommended_tick_hz is not None else ""),
+                    f"Recommended end trim: {timing_hint.recommended_end_trim_ticks} tick(s)"
+                    + (f" ({timing_hint.reason})" if timing_hint.reason else ""),
+                    f"Restart guard: {self.vgm_restart_guard_var.get()} tick(s), about 200 ms",
                     f"YM3812 register writes: {a.ym3812_writes}",
                     f"Detected note spans: {len(a.notes)}",
                     f"Normalized timbres at note-on: {len(a.instruments)}",
@@ -2865,12 +3517,13 @@ def run_gui(initial_root: Optional[Path] = None) -> None:
                         lines.append(f"  {label}: {count}")
                 lines += [
                     "",
-                    "v0.5 conversion:",
+                    "v0.6.7 conversion:",
                     "  - A0/B0 key state -> note/rest duration streams",
                     "  - 20/40/60/80/E0/C0 -> normalized 28-byte INS timbres",
                     "  - timbre changes at note-on -> MUS instrument events",
                     "  - A0/B0 frequency motion while keyed -> MUS pitch events",
-                    "  - OPL operator VIB + 0xBD depth -> preserved in INS for native YM3812 LFO",
+                    "  - OPL operator VIB -> native INS flags, or optional MUS-pitch bake",
+                    "  - DRO-verified restart guard key-offs, fades TL to silence, then leaves muted ticks before ED2 hard-reset",
                     f"  - 40h Total Level changes -> recovered MUS volume events ({len(a.volume_points)} source points)",
                     "  - 0xBD rhythm bits -> Bass/Snare/Tom/Cymbal/Hi-hat voices",
                     "  - MUS is built from scratch; no structural template is used",
@@ -2898,6 +3551,7 @@ def run_gui(initial_root: Optional[Path] = None) -> None:
                 bpm = int(self.vgm_bpm_var.get().strip(), 0)
                 beats = int(self.vgm_beats_var.get().strip(), 0)
                 end_trim = int(self.vgm_end_trim_var.get().strip(), 0)
+                restart_guard = int(self.vgm_restart_guard_var.get().strip(), 0)
                 if not 1 <= tpb <= 65535:
                     raise ValueError("ticks/beat must be 1..65535")
                 if not 1 <= bpm <= 65535:
@@ -2906,11 +3560,19 @@ def run_gui(initial_root: Optional[Path] = None) -> None:
                     raise ValueError("beats/measure must be 1..65535")
                 if not 0 <= end_trim <= 65534:
                     raise ValueError("reduce end ticks must be 0..65534")
+                if restart_guard < 0 or 0 < restart_guard < 4:
+                    raise ValueError("restart guard must be 0 or at least 4 ticks")
                 bgm = self.root_dir / "BGM"
                 out_mus = bgm / f"{target_stem}.MUS"
                 out_ins = bgm / f"{target_stem}.INS"
                 tick_hz = tpb * bpm / 60.0
                 loop_mode = "vgm" if self.vgm_loop_var.get().startswith("VGM loop") else "full"
+                vibrato_mode = "bake" if self.vgm_vibrato_var.get().startswith("Bake") else "native"
+                seam_choice = self.vgm_seam_var.get()
+                legacy_terminal_preload = seam_choice.startswith("Legacy v0.6.5")
+                ed2_loop_seam = not seam_choice.startswith("No restart guard")
+                if not ed2_loop_seam or legacy_terminal_preload:
+                    restart_guard = 0
                 if loop_mode == "vgm":
                     analysis = self.vgm_analysis if self.vgm_analysis is not None and self.vgm_path == Path(source) else analyze_vgm(Path(source))
                     if analysis.loop_sample is None:
@@ -2920,6 +3582,8 @@ def run_gui(initial_root: Optional[Path] = None) -> None:
                     f"Timing: {tpb} ticks/beat, {bpm} BPM = {tick_hz:g} ticks/sec\n"
                     f"Loop: {'VGM loop body -> MUS tick 0' if loop_mode == 'vgm' else 'full song -> restart at tick 0'}\n"
                     f"Reduce end ticks: {end_trim}\n"
+                    f"Restart guard: {restart_guard} tick(s)\n"
+                    f"Loop seam: {seam_choice}\n"
                     f"Output: {out_mus.name} + {out_ins.name}\n"
                     "Existing target files will receive one-time .bak backups."
                 )
@@ -2930,6 +3594,10 @@ def run_gui(initial_root: Optional[Path] = None) -> None:
                     ticks_per_beat=tpb, base_tempo=bpm,
                     beats_per_measure=beats, make_backup=True, loop_mode=loop_mode,
                     end_trim_ticks=end_trim,
+                    restart_guard_ticks=restart_guard,
+                    vibrato_mode=vibrato_mode,
+                    ed2_loop_seam=ed2_loop_seam,
+                    legacy_terminal_preload=legacy_terminal_preload,
                 )
                 self._populate_ins_files()
                 self._populate_mus_files()
@@ -2959,6 +3627,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--bulk-mon", nargs=2, metavar=("FIELD", "EXPR"), help="bulk-adjust all monsters; EXPR: +10, *1.5, log10(x)*100, x+log2(x)*20, ramp*1.5")
     parser.add_argument("--export-ins-csv", type=Path, help="export all INS records to CSV and exit")
     parser.add_argument("--analyze-vgm", type=Path, help="analyze a VGM/VGZ YM3812 file and print JSON")
+    parser.add_argument("--analyze-dro", type=Path, help="analyze a DOSBox DRO v2 loop restart and print JSON")
     parser.add_argument("--vgm-import", nargs="+", metavar="ARG", help="convert SOURCE.vgm/vgz directly to ED2 BGM/TARGET.MUS+.INS. New syntax: SOURCE TARGET. Old SOURCE TEMPLATE TARGET is accepted for timing defaults.")
     parser.add_argument("--vgm-tpb", type=int, help=f"ticks per beat for --vgm-import (default: {ED2_DEFAULT_TICKS_PER_BEAT})")
     parser.add_argument("--vgm-bpm", type=int, help=f"base tempo BPM for --vgm-import (default: {ED2_DEFAULT_BASE_TEMPO})")
@@ -2966,11 +3635,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--vgm-tick-hz", type=float, help="legacy convenience option; base BPM is derived from this tick rate and --vgm-tpb")
     parser.add_argument("--vgm-loop", choices=("full", "vgm", "auto"), default="auto", help="loop handling: full keeps intro; vgm moves VGM loop body to MUS tick 0; auto uses VGM loop when present")
     parser.add_argument("--vgm-end-trim", type=int, default=0, help="remove this many ticks from the generated MUS end (default: 0)")
+    parser.add_argument("--vgm-restart-guard", type=int, help="post-key-off fade/silence ticks before ED2 hard-resets OPL (default: about 200 ms)")
+    parser.add_argument("--vgm-vibrato", choices=("native", "bake"), default="native", help="native preserves INS VIB bits; bake approximates hardware VIB in MUS pitch and clears those bits")
+    parser.add_argument(
+        "--vgm-loop-seam",
+        choices=("safe", "equal", "legacy-preload", "ed2", "legacy"),
+        default="safe",
+        help=(
+            "safe: DRO-verified release fade plus silent restart guard (default); "
+            "equal: disable the restart guard for diagnosis; "
+            "legacy-preload: reproduce v0.6.5 terminal instrument writes for diagnosis. "
+            "ed2/legacy are compatibility aliases for safe/equal."
+        ),
+    )
+    parser.add_argument("--vgm-auto-config", action="store_true", help="derive BPM and proven terminal trim from the VGM header/command stream")
     parser.add_argument("--no-gui", action="store_true", help="do not start the GUI")
     args = parser.parse_args(argv)
 
     root = args.root.resolve() if args.root else None
-    action = any((args.report_json, args.export_mon_csv, args.import_mon_csv, args.export_ins_csv, args.bulk_mon, args.analyze_vgm, args.vgm_import))
+    action = any((args.report_json, args.export_mon_csv, args.import_mon_csv, args.export_ins_csv, args.bulk_mon, args.analyze_vgm, args.analyze_dro, args.vgm_import))
     root_required = any((args.report_json, args.export_mon_csv, args.import_mon_csv, args.export_ins_csv, args.bulk_mon, args.vgm_import))
     if root_required and root is None:
         parser.error("ROOT is required for this CLI action")
@@ -2998,6 +3681,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.analyze_vgm:
         a = analyze_vgm(args.analyze_vgm)
+        timing_hint = inspect_vgm_timing(args.analyze_vgm, args.vgm_tpb or ED2_DEFAULT_TICKS_PER_BEAT)
         print(json.dumps({
             "file": str(args.analyze_vgm),
             "duration_seconds": round(a.duration_seconds, 3),
@@ -3011,7 +3695,19 @@ def main(argv: Optional[list[str]] = None) -> int:
             "pitch_points": len(a.pitch_points),
             "volume_points": len(a.volume_points),
             "loop_sample": a.loop_sample,
+            "vgm_header_rate_hz": timing_hint.header_rate_hz,
+            "recommended_base_tempo": timing_hint.recommended_base_tempo,
+            "recommended_tick_hz": timing_hint.recommended_tick_hz,
+            "recommended_end_trim_ticks": timing_hint.recommended_end_trim_ticks,
+            "timing_reason": timing_hint.reason,
         }, ensure_ascii=False, indent=2))
+    if args.analyze_dro:
+        dro_report = audit_dro_loop_restart(args.analyze_dro)
+        # Boundary rows are useful for CSV export but too verbose for terminal JSON.
+        compact = dict(dro_report)
+        compact["boundary_event_count"] = len(compact.pop("boundary_rows", []))
+        print(json.dumps(compact, ensure_ascii=False, indent=2))
+
     if args.vgm_import:
         if len(args.vgm_import) not in (2, 3):
             parser.error("--vgm-import expects SOURCE TARGET, or legacy SOURCE TEMPLATE TARGET")
@@ -3036,6 +3732,23 @@ def main(argv: Optional[list[str]] = None) -> int:
             if args.vgm_tick_hz <= 0:
                 parser.error("--vgm-tick-hz must be > 0")
             bpm = max(1, int(math.floor(args.vgm_tick_hz * 60.0 / tpb + 0.5)))
+        end_trim = args.vgm_end_trim
+        if args.vgm_auto_config:
+            timing_hint = inspect_vgm_timing(Path(source_text), tpb)
+            if timing_hint.recommended_base_tempo is not None:
+                bpm = timing_hint.recommended_base_tempo
+            if end_trim == 0:
+                end_trim = timing_hint.recommended_end_trim_ticks
+
+        restart_guard = args.vgm_restart_guard
+        if restart_guard is None:
+            restart_guard = max(4, int(math.ceil((tpb * bpm / 60.0) * 0.20)))
+        if args.vgm_loop_seam in ("equal", "legacy"):
+            restart_guard = 0
+        if args.vgm_loop_seam == "legacy-preload":
+            restart_guard = 0
+        if restart_guard < 0 or 0 < restart_guard < 4:
+            parser.error("--vgm-restart-guard must be 0 or at least 4")
 
         report = convert_vgm_to_ed2_pair(
             Path(source_text),
@@ -3046,7 +3759,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             beats_per_measure=beats,
             make_backup=True,
             loop_mode=args.vgm_loop,
-            end_trim_ticks=args.vgm_end_trim,
+            end_trim_ticks=end_trim,
+            restart_guard_ticks=restart_guard,
+            vibrato_mode=args.vgm_vibrato,
+            ed2_loop_seam=args.vgm_loop_seam in ("safe", "ed2", "legacy-preload"),
+            legacy_terminal_preload=args.vgm_loop_seam == "legacy-preload",
         )
         print(json.dumps(report, ensure_ascii=False, indent=2))
 
